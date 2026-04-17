@@ -19,6 +19,7 @@ import time
 import signal
 import logging
 import json
+import uuid
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -33,6 +34,47 @@ from app.config import settings
 
 # Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
 from utils.mock_llm import ask as llm_ask
+
+# ─────────────────────────────────────────────────────────
+# Redis + Session (Stateless)
+# ─────────────────────────────────────────────────────────
+_redis_client = None
+USE_REDIS = False
+
+def _init_redis():
+    global _redis_client, USE_REDIS
+    if not settings.redis_url:
+        return
+    try:
+        import redis
+        _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        _redis_client.ping()
+        USE_REDIS = True
+    except Exception as e:
+        USE_REDIS = False
+        _redis_client = None
+
+def _save_session(session_id: str, data: dict, ttl: int = 3600):
+    if USE_REDIS and _redis_client:
+        _redis_client.setex(f"session:{session_id}", ttl, json.dumps(data))
+
+def _load_session(session_id: str) -> dict:
+    if USE_REDIS and _redis_client:
+        data = _redis_client.get(f"session:{session_id}")
+        return json.loads(data) if data else {}
+    return {}
+
+def _append_history(session_id: str, role: str, content: str):
+    session = _load_session(session_id)
+    history = session.get("history", [])
+    history.append({"role": role, "content": content,
+                    "ts": datetime.now(timezone.utc).isoformat()})
+    if len(history) > 20:
+        history = history[-20:]
+    session["history"] = history
+    _save_session(session_id, session)
+
+_init_redis()
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -145,7 +187,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -165,12 +208,16 @@ async def request_middleware(request: Request, call_next):
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
+    session_id: str | None = Field(default=None,
+                                   description="Session ID for conversation continuity. Auto-created if not provided.")
 
 class AskResponse(BaseModel):
     question: str
     answer: str
     model: str
     timestamp: str
+    session_id: str
+    storage: str
 
 # ─────────────────────────────────────────────────────────
 # Endpoints
@@ -200,21 +247,28 @@ async def ask_agent(
     Send a question to the AI agent.
 
     **Authentication:** Include header `X-API-Key: <your-key>`
+    **Conversation:** Send `session_id` to continue a conversation.
     """
     # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+    check_rate_limit(_key[:8])
 
     # Budget check
     input_tokens = len(body.question.split()) * 2
     check_and_record_cost(input_tokens, 0)
 
+    # Session management
+    session_id = body.session_id or str(uuid.uuid4())
+    _append_history(session_id, "user", body.question)
+
     logger.info(json.dumps({
         "event": "agent_call",
         "q_len": len(body.question),
+        "session_id": session_id,
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
     answer = llm_ask(body.question)
+    _append_history(session_id, "assistant", answer)
 
     output_tokens = len(answer.split()) * 2
     check_and_record_cost(0, output_tokens)
@@ -224,6 +278,8 @@ async def ask_agent(
         answer=answer,
         model=settings.llm_model,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        session_id=session_id,
+        storage="redis" if USE_REDIS else "in-memory",
     )
 
 

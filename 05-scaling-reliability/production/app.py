@@ -35,14 +35,16 @@ from utils.mock_llm import ask
 try:
     import redis
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    print(f"Trying Redis at: {REDIS_URL}")
     _redis = redis.from_url(REDIS_URL, decode_responses=True)
     _redis.ping()
     USE_REDIS = True
     print("✅ Connected to Redis")
-except Exception:
+except Exception as e:
     USE_REDIS = False
     _memory_store: dict = {}
-    print("⚠️  Redis not available — using in-memory store (not scalable!)")
+    print(f"❌ Redis connection failed: {type(e).__name__}: {e}")
+    print("⚠️  Falling back to in-memory store (not scalable!)")
 
 
 logging.basicConfig(level=logging.INFO)
@@ -217,4 +219,4 @@ def ready():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
